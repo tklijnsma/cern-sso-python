@@ -21,6 +21,50 @@ log.addHandler(NullHandler())
 DEFAULT_TIMEOUT_SECONDS = 10
 
 
+
+# ____________________________________________________
+# Context manager to temporarily disable ssl verification
+# see: https://stackoverflow.com/a/15445989/9209944
+
+import warnings
+import contextlib
+from urllib3.exceptions import InsecureRequestWarning
+
+old_merge_environment_settings = requests.Session.merge_environment_settings
+
+@contextlib.contextmanager
+def no_ssl_verification():
+    opened_adapters = set()
+
+    def merge_environment_settings(self, url, proxies, stream, verify, cert):
+        # Verification happens only once per connection so we need to close
+        # all the opened adapters once we're done. Otherwise, the effects of
+        # verify=False persist beyond the end of this context manager.
+        opened_adapters.add(self.get_adapter(url))
+
+        settings = old_merge_environment_settings(self, url, proxies, stream, verify, cert)
+        settings['verify'] = False
+
+        return settings
+
+    requests.Session.merge_environment_settings = merge_environment_settings
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', InsecureRequestWarning)
+            yield
+    finally:
+        requests.Session.merge_environment_settings = old_merge_environment_settings
+
+        for adapter in opened_adapters:
+            try:
+                adapter.close()
+            except:
+                pass
+
+# ____________________________________________________
+
+
 def _init_session(s, url, cookiejar, auth_url_fragment):
     """
     Internal helper function: initialise the sesion by trying to access
@@ -52,7 +96,7 @@ def _init_session(s, url, cookiejar, auth_url_fragment):
     return final_auth_url
 
 
-def _finalise_login(s, auth_results):
+def _finalise_login(s, auth_results, return_session=False):
     """
     Perform the final POST authentication steps to fully authenticate
     the session, saving any cookies in s' cookie jar.
@@ -88,10 +132,10 @@ def _finalise_login(s, auth_results):
     # The session cookie jar should now contain the necessary cookies.
     log.debug("Cookie jar now contains: %s" % str(s.cookies))
 
-    return s.cookies
+    return s if return_session else s.cookies
 
 
-def krb_sign_on(url, cookiejar=None):
+def krb_sign_on(url, cookiejar=None, return_session=False):
     """
     Perform Kerberos-backed single-sign on against a provided
     (protected) URL.
@@ -121,8 +165,22 @@ def krb_sign_on(url, cookiejar=None):
         r2 = s.get(krb_auth_url, auth=kerberos_auth,
                    timeout=DEFAULT_TIMEOUT_SECONDS)
 
-        return _finalise_login(s, auth_results=r2)
+        return _finalise_login(s, auth_results=r2, return_session=return_session)
 
+def krb_sign_on_noverify(url, cookiejar=None, return_session=False):
+    """
+    Wrapper around krb_sign_on that disables ssl verification
+    Many cern.ch endpoints require the cern root certificate and editing
+    all this code to be able to handle certificates is a pain, hence turning
+    ssl verification off entirely.
+
+    Clearly this is suboptimal and the user should be careful
+    """
+    log.warning('Turning off ssl verification entirely - please be careful')
+    with no_ssl_verification():
+        s = krb_sign_on(url, cookiejar, return_session=return_session)
+    if return_session: s.verify = False
+    return s
 
 def cert_sign_on(url, cert_file, key_file, cookiejar={}):
     """
